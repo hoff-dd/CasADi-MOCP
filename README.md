@@ -1,2 +1,2 @@
-# kMOCP
-Interface for solving Multi-Phase Optimal Control Problems for Kerbal Space Program kRPC scripts
+# CasADi-MOCP
+Self-contained multi-phase optimal control transcription using only CasADi (+ its bundled IPOPT/MUMPS).
