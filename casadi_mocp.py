@@ -3,6 +3,7 @@ Multi-phase optimal control transcription using CasADi/IPOPT.
 """
 
 import re
+import inspect
 import collections
 import casadi
 
@@ -22,6 +23,49 @@ def parse_variable_name(name):
 def is_valid_name(s):
     return re.fullmatch(r'\w+', s) is not None
 
+def get_all_SX_leaves(e):
+    result = []
+    stack = [e]
+    while stack:
+        x = stack.pop()
+        if x.is_leaf():
+            if x.is_symbolic() and not any(casadi.is_equal(x, r) for r in result):
+                result.append(x)
+        else:
+            for i in range(x.n_dep()):
+                stack.append(x.dep(i))
+    return result
+
+def has_trajectory_variable(sx_list):
+    return any(parse_variable_name(v.name()).flag == 'T' for v in sx_list)
+
+def get_unique_phase_names(sx_list):
+    names = [parse_variable_name(v.name()).phase for v in sx_list]
+    return list(set(n for n in names if n is not None))
+
+__generated_names_count = dict()
+
+def make_name_from_caller_info(caller_info):
+    filename = caller_info.filename.split('/')[-1]
+    if filename.endswith('.py'):
+        filename = filename[:-3]
+    name = ''.join(caller_info.code_context or [''])
+    name = re.sub(r'\s+', ' ', name).strip()
+    name = name.replace('<', 'LEQ').replace('>', 'GEQ').replace('==', 'EQ')
+    name = re.sub(r'\W+', ' ', name).strip()
+    name = re.sub(r'\s+', '_', name)
+    name = re.sub('.*?add.*?constraint', '', name)
+    name = re.sub('.*?add.*?objective', '', name)
+    name = filename + '_L' + str(caller_info.lineno) + '_' + name
+    name = name.replace('__', '_')
+
+    if name in __generated_names_count:
+        __generated_names_count[name] += 1
+        name += '_' + str(__generated_names_count[name])
+    else:
+        __generated_names_count[name] = 1
+    return name
+
 
 class Trajectory:
     def __init__(self, phase_name, trajectory_name, n_intervals, init_value, parent_phase):
@@ -40,6 +84,26 @@ class Scalar:
         self.symbol = casadi.SX.sym(sym_name)
         self.value = float(value)
 
+class Constraint:
+    def __int__(self, name, is_equation, is_path_constraint, g):
+        assert isinstance(g, casadi.SX) and g.numel() == 1
+        self.name = name
+        self.is_equation = is_equation
+        self.is_path_constraint = is_path_constraint
+        self.g = g
+        self.phase_name = None
+        self.parent_phase = None
+
+        leaves = get_all_SX_leaves(g)
+        _has_traj = has_trajectory_variable(leaves)
+        phase_names = get_unique_phase_names(leaves)
+        if is_path_constraint:
+            assert _has_traj, 'A path constraint must use a trajectory variable.'
+            assert len(phase_names) == 1, 'A path constraint must apply to exactly one phase.'
+            self.phase_name = phase_names[0]
+        else:
+            assert not _has_traj, 'A simple constraint must not use trajectory variables. Use a path constraint.'
+
 
 class Phase:
     def __init__(self, phase_name, n_intervals, duration_value, parent_mocp):
@@ -50,6 +114,7 @@ class Phase:
         self.n_intervals = n_intervals
         self.duration_symbol = casadi.SX.sym('D/' + phase_name + '/')
         self.duration_value = duration_value
+        self.constraints = dict()
 
     def add_trajectory(self, trajectory_name, init_value):
         assert is_valid_name(trajectory_name)
@@ -63,6 +128,8 @@ class MultiPhaseOptimalControlProblem:
         self.phases = dict()
         self.variables = dict()
         self.parameters = dict()
+        self.constraints = dict()
+        self.objectives = dict()
 
     def create_phase(self, phase_name, **kwargs):
         assert phase_name not in self.phases
@@ -104,3 +171,42 @@ class MultiPhaseOptimalControlProblem:
         assert info.flag == 'T'
         assert self.phases[info.phase].trajectories[info.name].derivative is None
         self.phases[info.phase].trajectories[info.name].derivative = dxdt_fn
+
+    def _add_constraint_impl(self, constraint_expr, name, is_path_constraint):
+        assert isinstance(constraint_expr, casadi.SX) and constraint_expr.numel() == 1
+        op = constraint_expr.op()
+        assert op in (casadi.OP_LE, casadi.OP_LT, casadi.OP_EQ)
+        is_equation = (op == casadi.OP_EQ)
+        g = constraint_expr.dep(0) - constraint_expr.dep(1)
+        constraint = Constraint(name, is_equation, is_path_constraint, g)
+        if is_path_constraint:
+            assert name not in self.phases[constraint.phase_name].constraints, 'Duplicate name'
+            constraint.parent_phase = self.phases[constraint.phase_name]
+            self.phases[constraint.phase_name].constraints[name] = constraint
+        else:
+            assert name not in self.constraints, 'Duplicate name'
+            self.constraints[name] = constraint
+
+    def add_constraint(self, constraint_expr, **kwargs):
+        name = kwargs.get('name') or make_name_from_caller_info(
+            inspect.getouterframes(inspect.currentframe())[1])
+        self._add_constraint_impl(constraint_expr, name, False)
+        return name
+
+    def add_path_constraint(self, constraint_expr, **kwargs):
+        name = kwargs.get('name') or make_name_from_caller_info(
+            inspect.getouterframes(inspect.currentframe())[1])
+        self._add_constraint_impl(constraint_expr, name, True)
+        return name
+
+    def add_objective(self, f, **kwargs):
+        name = kwargs.get('name') or make_name_from_caller_info(
+            inspect.getouterframes(inspect.currentframe())[1])
+        assert not has_trajectory_variable(get_all_SX_leaves(f)), \
+            'Simple objectives may not contain a trajectory variable. Use a mean/integral objective.'
+        assert name not in self.objectives, 'Duplicate name'
+        self.objectives[name] = f
+        return name
+
+    def remove_objective(self, objective_name):
+        del self.objectives[objective_name]
