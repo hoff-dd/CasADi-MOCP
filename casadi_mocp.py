@@ -1,5 +1,13 @@
 """
 Multi-phase optimal control transcription using CasADi/IPOPT.
+
+Symbol naming:
+    D/<phase>/          phase duration
+    T/<phase>/<name>    trajectory "interior" placeholder (pre-transcription)
+    S/<phase>/<name>    trajectory value at phase start
+    E/<phase>/<name>    trajectory value at phase end
+    V//<name>           free scalar variable
+    P//<name>           fixed parameter
 """
 
 import re
@@ -171,6 +179,68 @@ class MultiPhaseOptimalControlProblem:
         assert info.flag == 'T'
         assert self.phases[info.phase].trajectories[info.name].derivative is None
         self.phases[info.phase].trajectories[info.name].derivative = dxdt_fn
+
+    def inital(self, sx_trajectory): return self.start(sx_trajectory)
+    def start(self, sx_trajectory): return self._get_boundary(sx_trajectory, 'start')
+    def final(self, sx_trajectory): return self.end(sx_trajectory)
+    def end(self, sx_trajectory): return self._get_boundary(sx_trajectory, 'end')
+
+    def _get_boundary(self, sx, boundary_name):
+        assert isinstance(sx, casadi.SX)
+        if sx.numel() > 1:
+            result = casadi.SX.zeros(sx.size1(), sx.size2())
+            for i in range(sx.size1()):
+                for j in range(sx.size2()):
+                    result[i, j] = self._get_boundary(sx[i, j], boundary_name)
+            return result
+        if sx.is_leaf():
+            assert sx.is_symbolic()
+            info = parse_variable_name(sx.name())
+            assert info.flag == 'T'
+            t = self.phases[info.phase].trajectories[info.name]
+            return t.start if boundary_name == 'start' else t.end
+        leaves = [{'sym': e, 'info': parse_variable_name(e.name())} for e in get_all_SX_leaves(sx)]
+        assert len(set(e['info'].phase for e in leaves if e['info'].flag == 'T')) == 1, 'Error, mixed phases'
+        subs = [(e['sym'], self._get_boundary(e['sym'], boundary_name))
+                for e in leaves if e['info'].flag == 'T']
+        return casadi.substitute([sx], [s[0] for s in subs], [s[1] for s in subs])[0]
+
+    def get_value(self, sx): return self.access_value(sx)
+
+    def set_value(self, sx, value):
+        assert isinstance(value, float)
+        self.access_value(sx, value)
+
+    def access_value(self, sx, new_value=None):
+        assert isinstance(sx, casadi.SX) and sx.numel() == 1 and sx.is_symbolic()
+        info = parse_variable_name(sx.name())
+        if info.flag == 'T':
+            raise RuntimeError('Paths are evaluated using Phase.interpolate()')
+        assert info.flag in ('D', 'S', 'E', 'V', 'P')
+        if info.flag == 'P':
+            if isinstance(new_value, float): self.parameters[info.name].value = new_value
+            return self.parameters[info.name].value
+        if info.flag == 'V':
+            if isinstance(new_value, float): self.variables[info.name].value = new_value
+            return self.variables[info.name].value
+        if info.flag == 'D':
+            if isinstance(new_value, float): self.phases[info.phase].duration_value = new_value
+            return self.phases[info.phase].duration_value
+        if info.flag == 'S':
+            if isinstance(new_value, float): self.phases[info.phase].trajectories[info.name].values[0] = new_value
+            return self.phases[info.phase].trajectories[info.name].values[0]
+        if info.flag == 'E':
+            if isinstance(new_value, float): self.phases[info.phase].trajectories[info.name].values[-1] = new_value
+            return self.phases[info.phase].trajectories[info.name].values[-1]
+        raise RuntimeError('unreachable')
+
+    def get_symbol_value_pairs(self):
+        return \
+            [(e.symbol, e.value) for e in self.variables.values()] + \
+            [(e.symbol, e.value) for e in self.parameters.values()] + \
+            [(e.duration_symbol, e.duration_value) for e in self.phases.values()] + \
+            [(f.start, f.values[0]) for e in self.phases.values() for f in e.trajectories.values()] + \
+            [(f.end, f.values[-1]) for e in self.phases.values() for f in e.trajectories.values()]
 
     def _add_constraint_impl(self, constraint_expr, name, is_path_constraint):
         assert isinstance(constraint_expr, casadi.SX) and constraint_expr.numel() == 1
