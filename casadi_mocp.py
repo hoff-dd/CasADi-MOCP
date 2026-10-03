@@ -6,6 +6,7 @@ Symbol naming:
     T/<phase>/<name>    trajectory "interior" placeholder (pre-transcription)
     S/<phase>/<name>    trajectory value at phase start
     E/<phase>/<name>    trajectory value at phase end
+    N/<phase>/<name>/<i>  trajectory value at interior node i
     V//<name>           free scalar variable
     P//<name>           fixed parameter
 """
@@ -15,7 +16,21 @@ import inspect
 import collections
 import casadi
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Collocation constants: 5-point Lobatto (LGL) quadrature on [0, 1].
+# Nodes are 0, (1 - sqrt(3/7))/2, 1/2, (1 + sqrt(3/7))/2, 1.
+# Integration_Matrix row k integrates the degree-4 interpolating polynomial from node 0 to node k+1; the last row
+# equals the LGL quadrature weights. Constants as in https://doi.org/10.21914/anziamj.v47i0.1033.
+# ---------------------------------------------------------------------------------------------------------------------
 N_NODES = 5
+NODES = [0.0, 0.172673164646011, 0.5, 0.827326835353989, 1.0]
+INTEGRATION_MATRIX = [
+    [ 0.0677284321861569,  0.119744769343412,  -0.0217357218665581,   0.0106358242254155, -0.00370013924241453],
+    [           0.040625,  0.303184183323043,    0.177777777777778,  -0.0309619611008206,             0.009375],
+    [ 0.0537001392424145,  0.261586397996807,    0.377291277422114,    0.152477452878811,  -0.0177284321861569],
+    [               0.05,  0.272222222222222,    0.355555555555556,    0.272222222222222,                 0.05],
+]
+
 VariableInfo = collections.namedtuple('VariableInfo', ['flag', 'phase', 'name', 'index'])
 
 def parse_variable_name(name):
@@ -87,10 +102,12 @@ class Trajectory:
         self.values = [init_value] * (n_intervals * (N_NODES - 1) + 1)
         self.parent_phase = parent_phase
 
+
 class Scalar:
     def __init__(self, sym_name, value):
         self.symbol = casadi.SX.sym(sym_name)
         self.value = float(value)
+
 
 class Constraint:
     def __int__(self, name, is_equation, is_path_constraint, g):
@@ -130,6 +147,7 @@ class Phase:
         self.trajectories[trajectory_name] = Trajectory(
             self.phase_name, trajectory_name, self.n_intervals, init_value, self)
         return self.trajectories[trajectory_name]
+
 
 class MultiPhaseOptimalControlProblem:
     def __init__(self):
@@ -280,3 +298,141 @@ class MultiPhaseOptimalControlProblem:
 
     def remove_objective(self, objective_name):
         del self.objectives[objective_name]
+
+    def solve(self, **kwargs):
+        transcriber = Transcriber(self)
+        _, x_value = transcriber.pack_variables()
+        _, p_value = transcriber.pack_parameters()
+        n_h, n_g = transcriber.nlp_h.numel(), transcriber.nlp_g.numel()
+        nlp = {'x': transcriber.nlp_x, 'p': transcriber.nlp_p, 'f': transcriber.nlp_f,
+               'g': casadi.vertcat(transcriber.nlp_h, transcriber.nlp_g)}
+        solver = casadi.nlpsol('nlpsolver', 'ipopt', nlp, {'ipopt': {'max_iter': 3000, 'linear_solver': 'mumps'}})
+        result = solver(x0=x_value, p=p_value,
+                        lbg=casadi.vertcat(casadi.DM.zeros(n_h), -casadi.inf * casadi.DM.ones(n_g)),
+                        ubg=casadi.DM.zeros(n_h + n_g))
+        solver_stats = solver.stats()
+        assert solver_stats['success'], 'IPOPT did not converge: ' + str(solver_stats['return_status'])
+        transcriber.unpack_variables(result['x'])
+        return {'result': result, 'solver_stats': solver_stats}
+
+
+class Transcriber:
+    def __init__(self, mocp):
+        self.mocp = mocp
+        self.phases = {name: TranscribedPhase(mocp.phases[name]) for name in mocp.phases}
+
+        total_objective = casadi.SX(0.0)
+        total_objective += sum(mocp.objectives.values())
+
+        equality_constraints = []
+        inequality_constraints = []
+        for tp in self.phases.values():
+            for tt in tp.trajectories.values():
+                if tt.ode_node_defects is not None:
+                    equality_constraints.append(tt.ode_node_defects)
+            equality_constraints.extend(c.g_nodes for c in tp.constraints.values() if c.ocp_constraint.is_equation)
+            inequality_constraints.extend(c.g_nodes for c in tp.constraints.values() if not c.ocp_constraint.is_equation)
+        equality_constraints.extend(c.g for c in mocp.constraints.values() if c.is_equation)
+        inequality_constraints.extend(c.g for c in mocp.constraints.values() if not c.is_equation)
+        equality_constraints = casadi.vertcat(casadi.SX(0, 1), *equality_constraints)
+        inequality_constraints = casadi.vertcat(casadi.SX(0, 1), *inequality_constraints)
+
+        x_symbol, _ = self.pack_variables()
+        x_names = [e.name() for e in casadi.vertsplit(x_symbol)]
+        assert len(set(x_names)) == len(x_names), 'Duplicate variable name!'
+
+        p_symbol, _ = self.pack_parameters()
+        self.nlp_x = x_symbol
+        self.nlp_p = p_symbol
+        self.nlp_f = total_objective
+        self.nlp_h = equality_constraints
+        self.nlp_g = inequality_constraints
+
+    def pack_variables(self):
+        symbols, values = [], []
+        for phase_name in self.mocp.phases:
+            phase = self.mocp.phases[phase_name]
+            for trajectory_name in phase.trajectories:
+                symbols.extend(self.phases[phase_name].trajectories[trajectory_name].node_symbols)
+                values.extend(phase.trajectories[trajectory_name].values)
+            symbols.append(phase.duration_symbol)
+            values.append(phase.duration_value)
+        for v in self.mocp.variables.values():
+            symbols.append(v.symbol)
+            values.append(v.value)
+        return (casadi.vertcat(casadi.SX(0, 1), *symbols),
+                casadi.vertcat(casadi.DM(0, 1), *[casadi.DM(v) for v in values]))
+
+    def unpack_variables(self, x_value):
+        j = 0
+        for phase in self.mocp.phases.values():
+            for t in phase.trajectories.values():
+                for i in range(len(t.values)):
+                    t.values[i] = float(x_value[j]); j += 1
+            phase.duration_value = float(x_value[j]); j += 1
+        for v in self.mocp.variables.values():
+            v.value = float(x_value[j]); j += 1
+        assert x_value.numel() == j
+
+    def pack_parameters(self):
+        symbols = [p.symbol for p in self.mocp.parameters.values()]
+        values = [p.value for p in self.mocp.parameters.values()]
+        return (casadi.vertcat(casadi.SX(0, 1), *symbols),
+                casadi.vertcat(casadi.DM(0, 1), *[casadi.DM(v) for v in values]))
+
+
+class TranscribedPhase:
+    def __init__(self, ocp_phase):
+        self.ocp_phase = ocp_phase
+        self.trajectories = {name: TranscribedTrajectory(ocp_phase.trajectories[name])
+                             for name in ocp_phase.trajectories}
+
+        n_phase_nodes = ocp_phase.n_intervals * (N_NODES - 1) + 1
+        interiors = [t.trajectory_interior for t in ocp_phase.trajectories.values()]
+        self.node_substitutions = \
+            [(interiors, [self.trajectories[name].node_symbols[i] for name in ocp_phase.trajectories])
+            for i in range(n_phase_nodes)]
+
+        for tt in self.trajectories.values():
+            tt.create_ode_constraints(self)
+
+        self.constraints = {name: TranscribedPathConstraint(ocp_phase.constraints[name], self)
+                            for name in ocp_phase.constraints}
+
+    def substitute_nodes(self, f):
+        return [casadi.substitute([f], sub[0], sub[1])[0] for sub in self.node_substitutions]
+
+
+class TranscribedTrajectory:
+    def __init__(self, ocp_trajectory):
+        self.ocp_trajectory = ocp_trajectory
+        n_phase_nodes = len(ocp_trajectory.values)
+        info = parse_variable_name(ocp_trajectory.trajectory_interior.name())
+        self.node_symbols = [None] * n_phase_nodes
+        for i in range(1, n_phase_nodes - 1):
+            self.node_symbols[i] = casadi.SX.sym('N/' + info.phase + '/' + info.name + '/' + str(i))
+        self.node_symbols[0] = ocp_trajectory.start
+        self.node_symbols[-1] = ocp_trajectory.end
+        self.ode_node_defects = None
+
+    def create_ode_constraints(self, transcribed_phase):
+        if self.ocp_trajectory.derivative is None:
+            return
+        n_intervals = transcribed_phase.ocp_phase.n_intervals
+        node_derivatives = transcribed_phase.substitute_nodes(self.ocp_trajectory.derivative)
+        interval_duration = transcribed_phase.ocp_phase.duration_symbol / n_intervals
+        defects = []
+        for i in range(n_intervals):
+            idx = [i * (N_NODES - 1) + k for k in range(N_NODES)]
+            dxdt = [node_derivatives[j] for j in idx]
+            x = [self.node_symbols[j] for j in idx]
+            delta_x = [(xi - x[0]) for xi in x[1:]]
+            dxdt_integrals = interval_duration * (casadi.DM(INTEGRATION_MATRIX) @ casadi.vertcat(*dxdt))
+            defects.append(dxdt_integrals - casadi.vertcat(*delta_x))
+        self.ode_node_defects = casadi.vertcat(*defects)
+
+
+class TranscribedPathConstraint:
+    def __init__(self, ocp_constraint, transcribed_phase):
+        self.ocp_constraint = ocp_constraint
+        self.g_nodes = casadi.vertcat(*transcribed_phase.substitute_nodes(ocp_constraint.g))
