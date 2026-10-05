@@ -30,6 +30,7 @@ INTEGRATION_MATRIX = [
     [ 0.0537001392424145,  0.261586397996807,    0.377291277422114,    0.152477452878811,  -0.0177284321861569],
     [               0.05,  0.272222222222222,    0.355555555555556,    0.272222222222222,                 0.05],
 ]
+INTEGRATION_WEIGHTS = [0.05, 0.272222222222222, 0.355555555555556, 0.272222222222222, 0.05]
 
 VariableInfo = collections.namedtuple('VariableInfo', ['flag', 'phase', 'name', 'index'])
 
@@ -110,7 +111,7 @@ class Scalar:
 
 
 class Constraint:
-    def __int__(self, name, is_equation, is_path_constraint, g):
+    def __init__(self, name, is_equation, is_path_constraint, g):
         assert isinstance(g, casadi.SX) and g.numel() == 1
         self.name = name
         self.is_equation = is_equation
@@ -140,6 +141,7 @@ class Phase:
         self.duration_symbol = casadi.SX.sym('D/' + phase_name + '/')
         self.duration_value = duration_value
         self.constraints = dict()
+        self.mean_objectives = dict()
 
     def add_trajectory(self, trajectory_name, init_value):
         assert is_valid_name(trajectory_name)
@@ -276,20 +278,17 @@ class MultiPhaseOptimalControlProblem:
             self.constraints[name] = constraint
 
     def add_constraint(self, constraint_expr, **kwargs):
-        name = kwargs.get('name') or make_name_from_caller_info(
-            inspect.getouterframes(inspect.currentframe())[1])
+        name = kwargs.get('name') or make_name_from_caller_info(inspect.getouterframes(inspect.currentframe())[1])
         self._add_constraint_impl(constraint_expr, name, False)
         return name
 
     def add_path_constraint(self, constraint_expr, **kwargs):
-        name = kwargs.get('name') or make_name_from_caller_info(
-            inspect.getouterframes(inspect.currentframe())[1])
+        name = kwargs.get('name') or make_name_from_caller_info(inspect.getouterframes(inspect.currentframe())[1])
         self._add_constraint_impl(constraint_expr, name, True)
         return name
 
     def add_objective(self, f, **kwargs):
-        name = kwargs.get('name') or make_name_from_caller_info(
-            inspect.getouterframes(inspect.currentframe())[1])
+        name = kwargs.get('name') or make_name_from_caller_info(inspect.getouterframes(inspect.currentframe())[1])
         assert not has_trajectory_variable(get_all_SX_leaves(f)), \
             'Simple objectives may not contain a trajectory variable. Use a mean/integral objective.'
         assert name not in self.objectives, 'Duplicate name'
@@ -298,6 +297,28 @@ class MultiPhaseOptimalControlProblem:
 
     def remove_objective(self, objective_name):
         del self.objectives[objective_name]
+
+    def add_integral_objective(self, f, **kwargs):
+        name = kwargs.get('name') or make_name_from_caller_info(inspect.getouterframes(inspect.currentframe())[1])
+        leaves = get_all_SX_leaves(f)
+        assert has_trajectory_variable(leaves), 'Integral objectives must use a trajectory variable.'
+        phase_names = get_unique_phase_names(leaves)
+        assert len(phase_names) == 1, 'Integral objectives must apply to exactly one phase.'
+        phase = self.phases[phase_names[0]]
+        assert name not in phase.mean_objectives, 'Duplicate name'
+        phase.mean_objectives[name] = phase.duration_symbol * f
+        return name
+
+    def add_mean_objective(self, f, **kwargs):
+        name = kwargs.get('name') or make_name_from_caller_info(inspect.getouterframes(inspect.currentframe())[1])
+        leaves = get_all_SX_leaves(f)
+        assert has_trajectory_variable(leaves), 'Mean objectives must use a trajectory variable.'
+        phase_names = get_unique_phase_names(leaves)
+        assert len(phase_names) == 1, 'Mean objectives must apply to exactly one phase.'
+        phase = self.phases[phase_names[0]]
+        assert name not in phase.mean_objectives, 'Duplicate name'
+        phase.mean_objectives[name] = f
+        return name
 
     def solve(self, **kwargs):
         transcriber = Transcriber(self)
@@ -323,6 +344,8 @@ class Transcriber:
 
         total_objective = casadi.SX(0.0)
         total_objective += sum(mocp.objectives.values())
+        for tp in self.phases.values():
+            total_objective += sum(tp.mean_objective_integrals.values())
 
         equality_constraints = []
         inequality_constraints = []
@@ -384,6 +407,7 @@ class Transcriber:
 class TranscribedPhase:
     def __init__(self, ocp_phase):
         self.ocp_phase = ocp_phase
+        self.mean_objective_integrals = dict()
         self.trajectories = {name: TranscribedTrajectory(ocp_phase.trajectories[name])
                              for name in ocp_phase.trajectories}
 
@@ -398,6 +422,15 @@ class TranscribedPhase:
 
         self.constraints = {name: TranscribedPathConstraint(ocp_phase.constraints[name], self)
                             for name in ocp_phase.constraints}
+
+        quadrature_weights = casadi.DM(INTEGRATION_WEIGHTS) / ocp_phase.n_intervals
+        for objective_name, dF_dtau in ocp_phase.mean_objectives.items():
+            dF_dtau_nodes = self.substitute_nodes(dF_dtau)
+            interval_means = []
+            for i in range(ocp_phase.n_intervals):
+                idx = [i * (N_NODES - 1) + k for k in range(N_NODES)]
+                interval_means.append(quadrature_weights.T @ casadi.vertcat(*[dF_dtau_nodes[k] for k in idx]))
+            self.mean_objective_integrals[objective_name] = sum(interval_means)
 
     def substitute_nodes(self, f):
         return [casadi.substitute([f], sub[0], sub[1])[0] for sub in self.node_substitutions]
