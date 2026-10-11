@@ -328,7 +328,9 @@ class MultiPhaseOptimalControlProblem:
         nlp = {'x': transcriber.nlp_x, 'p': transcriber.nlp_p, 'f': transcriber.nlp_f,
                'g': casadi.vertcat(transcriber.nlp_h, transcriber.nlp_g)}
         solver = casadi.nlpsol('nlpsolver', 'ipopt', nlp, {'ipopt': {'max_iter': 3000, 'linear_solver': 'mumps'}})
+        lbxubx = transcriber.nlp_fn_lb_ub.call({'p': p_value})
         result = solver(x0=x_value, p=p_value,
+                        lbx=lbxubx['lb'], ubx=lbxubx['ub'],
                         lbg=casadi.vertcat(casadi.DM.zeros(n_h), -casadi.inf * casadi.DM.ones(n_g)),
                         ubg=casadi.DM.zeros(n_h + n_g))
         solver_stats = solver.stats()
@@ -336,6 +338,7 @@ class MultiPhaseOptimalControlProblem:
         transcriber.unpack_variables(result['x'])
         return {'result': result, 'solver_stats': solver_stats}
 
+BoxConstraint = collections.namedtuple('BoxConstraint', ['variable', 'bound', 'is_upper_bound'])
 
 class Transcriber:
     def __init__(self, mocp):
@@ -360,16 +363,66 @@ class Transcriber:
         equality_constraints = casadi.vertcat(casadi.SX(0, 1), *equality_constraints)
         inequality_constraints = casadi.vertcat(casadi.SX(0, 1), *inequality_constraints)
 
+        eq_box, eq_other, ineq_box, ineq_other = [], [], [], []
+        for i in range(inequality_constraints.numel()):
+            b = self.parse_box_constraint(inequality_constraints[i])
+            (ineq_other if b is None else ineq_box).append(inequality_constraints[i] if b is None else b)
+        for i in range(equality_constraints.numel()):
+            b = self.parse_box_constraint(equality_constraints[i])
+            (eq_other if b is None else eq_box).append(equality_constraints[i] if b is None else b)
+
         x_symbol, _ = self.pack_variables()
         x_names = [e.name() for e in casadi.vertsplit(x_symbol)]
         assert len(set(x_names)) == len(x_names), 'Duplicate variable name!'
+        x_index = {n: i for i, n in enumerate(x_names)}
+        lower_bound = [casadi.SX(-casadi.inf)] * x_symbol.numel()
+        upper_bound = [casadi.SX(casadi.inf)] * x_symbol.numel()
+        for b in ineq_box:
+            i = x_index[b.variable.name()]
+            if b.is_upper_bound:
+                upper_bound[i] = casadi.fmin(upper_bound[i], b.bound)
+            else:
+                lower_bound[i] = casadi.fmax(lower_bound[i], b.bound)
+        for b in eq_box:
+            i = x_index[b.variable.name()]
+            upper_bound[i] = casadi.fmin(upper_bound[i], b.bound)
+            lower_bound[i] = casadi.fmax(lower_bound[i], b.bound)
 
         p_symbol, _ = self.pack_parameters()
         self.nlp_x = x_symbol
         self.nlp_p = p_symbol
         self.nlp_f = total_objective
-        self.nlp_h = equality_constraints
-        self.nlp_g = inequality_constraints
+        self.nlp_h = casadi.vertcat(casadi.SX(0, 1), *eq_other)
+        self.nlp_g = casadi.vertcat(casadi.SX(0, 1), *ineq_other)
+        self.nlp_lb = casadi.vertcat(*lower_bound) if lower_bound else casadi.SX(0, 1)
+        self.nlp_ub = casadi.vertcat(*upper_bound) if upper_bound else casadi.SX(0, 1)
+        self.nlp_fn_lb_ub = casadi.Function('nlp_fn_lb_ub',
+                                            [self.nlp_p], [self.nlp_lb, self.nlp_ub], ['p'], ['lb', 'ub'])
+
+    def parse_box_constraint(self, g):
+        assert g.numel() == 1
+        op = g.op()
+        if (not g.is_symbolic()) and (op not in (casadi.OP_SUB, casadi.OP_NEG)):
+            return None
+        if op == casadi.OP_SUB:
+            lhs, rhs = g.dep(0), g.dep(1)
+        elif op == casadi.OP_NEG:
+            lhs, rhs = casadi.SX(0.0), g.dep(0)
+        else:
+            lhs, rhs = g, casadi.SX(0.0)
+
+        if not (lhs.is_leaf() and rhs.is_leaf()):
+            return None
+        is_lhs_variable = (not lhs.is_constant()) and (not lhs.name().startswith('P'))
+        is_rhs_variable = (not rhs.is_constant()) and (not rhs.name().startswith('P'))
+        if is_lhs_variable and is_rhs_variable:
+            return None
+        if (not is_lhs_variable) and (not is_rhs_variable):
+            raise RuntimeError('A constraint without variables is non-sense')
+
+        if is_lhs_variable:
+            return BoxConstraint(variable=lhs, bound=rhs, is_upper_bound=True)
+        return BoxConstraint(variable=rhs, bound=lhs, is_upper_bound=False)
 
     def pack_variables(self):
         symbols, values = [], []
