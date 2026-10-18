@@ -324,19 +324,10 @@ class MultiPhaseOptimalControlProblem:
         transcriber = Transcriber(self)
         _, x_value = transcriber.pack_variables()
         _, p_value = transcriber.pack_parameters()
-        n_h, n_g = transcriber.nlp_h.numel(), transcriber.nlp_g.numel()
-        nlp = {'x': transcriber.nlp_x, 'p': transcriber.nlp_p, 'f': transcriber.nlp_f,
-               'g': casadi.vertcat(transcriber.nlp_h, transcriber.nlp_g)}
-        solver = casadi.nlpsol('nlpsolver', 'ipopt', nlp, {'ipopt': {'max_iter': 3000, 'linear_solver': 'mumps'}})
-        lbxubx = transcriber.nlp_fn_lb_ub.call({'p': p_value})
-        result = solver(x0=x_value, p=p_value,
-                        lbx=lbxubx['lb'], ubx=lbxubx['ub'],
-                        lbg=casadi.vertcat(casadi.DM.zeros(n_h), -casadi.inf * casadi.DM.ones(n_g)),
-                        ubg=casadi.DM.zeros(n_h + n_g))
-        solver_stats = solver.stats()
-        assert solver_stats['success'], 'IPOPT did not converge: ' + str(solver_stats['return_status'])
-        transcriber.unpack_variables(result['x'])
-        return {'result': result, 'solver_stats': solver_stats}
+        solver = HomotopyNlpSolver(transcriber)
+        result = solver.solver_loop(x_value, p_value, **kwargs)
+        transcriber.unpack_variables(result[-1]['result']['x'])
+        return result
 
 BoxConstraint = collections.namedtuple('BoxConstraint', ['variable', 'bound', 'is_upper_bound'])
 
@@ -522,3 +513,55 @@ class TranscribedPathConstraint:
     def __init__(self, ocp_constraint, transcribed_phase):
         self.ocp_constraint = ocp_constraint
         self.g_nodes = casadi.vertcat(*transcribed_phase.substitute_nodes(ocp_constraint.g))
+
+class HomotopyNlpSolver:
+    IPOPT_OPTIONS = {
+        'ipopt': {
+            'max_iter': 3000,
+            'mu_strategy': 'adaptive',
+            'linear_solver': 'mumps',
+        }
+    }
+
+    def __init__(self, transcriber):
+        self.transcriber = transcriber
+
+        x_names = [n.name() for n in casadi.vertsplit(transcriber.nlp_x)]
+        x_init_sym = casadi.vertcat(*[casadi.SX.sym('__init_' + n) for n in x_names])
+        init_penalty_weight_sym = casadi.SX.sym('__initPenaltyWeight')
+        init_penalty = init_penalty_weight_sym * casadi.sum1((transcriber.nlp_x - x_init_sym) ** 2)
+
+        self.casadi_lbg = casadi.vertcat(casadi.DM.zeros(transcriber.nlp_h.numel()),
+                                         (-casadi.inf) * casadi.DM.ones(transcriber.nlp_g.numel()))
+        self.casadi_ubg = casadi.vertcat(casadi.DM.zeros(transcriber.nlp_h.numel()),
+                                         casadi.DM.zeros(transcriber.nlp_g.numel()))
+        self.casadi_g = casadi.vertcat(transcriber.nlp_h, transcriber.nlp_g)
+        self.casadi_nlp = {'x': transcriber.nlp_x,
+                           'p': casadi.vertcat(transcriber.nlp_p, init_penalty_weight_sym, x_init_sym),
+                           'f': transcriber.nlp_f + init_penalty,
+                           'g': self.casadi_g,
+        }
+        self.casadi_nlpsol = casadi.nlpsol('nlpsolver', 'ipopt', self.casadi_nlp, self.IPOPT_OPTIONS)
+
+    def solver_step(self, x_value, p_value, init_penalty_weight):
+        lbxubx = self.transcriber.nlp_fn_lb_ub.call({'p': p_value})
+        call_args = dict(x0=x_value, lbx=lbxubx['lb'], ubx=lbxubx['ub'], lbg=self.casadi_lbg, ubg=self.casadi_ubg,
+                         p=casadi.vertcat(p_value, casadi.DM(init_penalty_weight), x_value))
+        result = self.casadi_nlpsol(**call_args)
+        solver_stats = self.casadi_nlpsol.stats()
+        assert solver_stats['success'], 'IPOPT did not converge: ' + str(solver_stats['return_status'])
+        return {'result': result, 'solver_stats': solver_stats}
+
+    def solver_loop(self, x_value, p_value, **kwargs):
+        init_penalty_weight = kwargs.get('initPenaltyWeight', 100.0)
+        beta = kwargs.get('beta', 0.1)
+        steps = kwargs.get('penaltyWeightReductionSteps', 5)
+        solve_original = kwargs.get('solveOriginalProblem', True)
+
+        status = []
+        for _ in range(steps):
+            status.append(self.solver_step(x_value, p_value, init_penalty_weight))
+            init_penalty_weight *= beta
+        if solve_original:
+            status.append(self.solver_step(x_value, p_value, 0.0))
+        return status
