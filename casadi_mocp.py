@@ -516,9 +516,26 @@ class TranscribedPathConstraint:
 
 class HomotopyNlpSolver:
     IPOPT_OPTIONS = {
+        'bound_consistency': False,
         'ipopt': {
-            'max_iter': 3000,
+            'max_iter': 2000,
+            'max_cpu_time': 1800,
             'mu_strategy': 'adaptive',
+            'nlp_scaling_method': 'gradient-based',
+            'mumps_permuting_scaling': 7,
+            'mumps_scaling': 8,
+            'bound_frac': 1e-06,
+            'bound_push': 1e-06,
+            'slack_bound_push': 1e-06,
+            'bound_relax_factor': 0.0,
+            'honor_original_bounds': 'no',
+            'warm_start_init_point': 'yes',
+            'warm_start_mult_bound_push': 1e-06,
+            'warm_start_bound_frac': 1e-06,
+            'warm_start_bound_push': 1e-06,
+            'warm_start_slack_bound_push': 1e-06,
+            'warm_start_slack_bound_frac': 1e-06,
+            'mu_max': 0.01,
             'linear_solver': 'mumps',
         }
     }
@@ -543,10 +560,13 @@ class HomotopyNlpSolver:
         }
         self.casadi_nlpsol = casadi.nlpsol('nlpsolver', 'ipopt', self.casadi_nlp, self.IPOPT_OPTIONS)
 
-    def solver_step(self, x_value, p_value, init_penalty_weight):
+    def solver_step(self, x_value, p_value, init_penalty_weight, previous_result=None):
         lbxubx = self.transcriber.nlp_fn_lb_ub.call({'p': p_value})
         call_args = dict(x0=x_value, lbx=lbxubx['lb'], ubx=lbxubx['ub'], lbg=self.casadi_lbg, ubg=self.casadi_ubg,
                          p=casadi.vertcat(p_value, casadi.DM(init_penalty_weight), x_value))
+        if previous_result is not None:
+            call_args['lam_x0'] = previous_result['lam_x']
+            call_args['lam_g0'] = previous_result['lam_g']
         result = self.casadi_nlpsol(**call_args)
         solver_stats = self.casadi_nlpsol.stats()
         assert solver_stats['success'], 'IPOPT did not converge: ' + str(solver_stats['return_status'])
@@ -558,10 +578,10 @@ class HomotopyNlpSolver:
         steps = kwargs.get('penaltyWeightReductionSteps', 5)
         solve_original = kwargs.get('solveOriginalProblem', True)
 
-        status = []
+        status = [{'result': None}]
         for _ in range(steps):
-            status.append(self.solver_step(x_value, p_value, init_penalty_weight))
+            status.append(self.solver_step(x_value, p_value, init_penalty_weight, status[-1]['result']))
             init_penalty_weight *= beta
         if solve_original:
-            status.append(self.solver_step(x_value, p_value, 0.0))
+            status.append(self.solver_step(x_value, p_value, 0.0, status[-1]['result']))
         return status
