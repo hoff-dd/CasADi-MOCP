@@ -322,12 +322,16 @@ class MultiPhaseOptimalControlProblem:
 
     def solve(self, **kwargs):
         transcriber = Transcriber(self)
-        _, x_value = transcriber.pack_variables()
+        x_symbol, x_value = transcriber.pack_variables()
         _, p_value = transcriber.pack_parameters()
         solver = HomotopyNlpSolver(transcriber)
         result = solver.solver_loop(x_value, p_value, **kwargs)
-        transcriber.unpack_variables(result[-1]['result']['x'])
-        return result
+        x_value = result[-1]['result']['x']
+        transcriber.unpack_variables(x_value)
+        slack_values = [(e[0].name(), float(e[1]))
+                        for e in zip(casadi.vertsplit(x_symbol), casadi.vertsplit(x_value))
+                        if '/slack' in e[0].name()]
+        return (result, slack_values)
 
 BoxConstraint = collections.namedtuple('BoxConstraint', ['variable', 'bound', 'is_upper_bound'])
 
@@ -544,9 +548,11 @@ class HomotopyNlpSolver:
         self.transcriber = transcriber
 
         x_names = [n.name() for n in casadi.vertsplit(transcriber.nlp_x)]
-        x_init_sym = casadi.vertcat(*[casadi.SX.sym('__init_' + n) for n in x_names])
+        self.y_indices = [i for i, n in enumerate(x_names) if '/slack' not in n]
+        y_sym = casadi.vertcat(*[transcriber.nlp_x[i] for i in self.y_indices])
+        y_init_sym = casadi.vertcat(*[casadi.SX.sym('__init_' + x_names[i]) for i in self.y_indices])
         init_penalty_weight_sym = casadi.SX.sym('__initPenaltyWeight')
-        init_penalty = init_penalty_weight_sym * casadi.sum1((transcriber.nlp_x - x_init_sym) ** 2)
+        init_penalty = init_penalty_weight_sym * casadi.sum1((y_sym - y_init_sym) ** 2)
 
         self.casadi_lbg = casadi.vertcat(casadi.DM.zeros(transcriber.nlp_h.numel()),
                                          (-casadi.inf) * casadi.DM.ones(transcriber.nlp_g.numel()))
@@ -554,7 +560,7 @@ class HomotopyNlpSolver:
                                          casadi.DM.zeros(transcriber.nlp_g.numel()))
         self.casadi_g = casadi.vertcat(transcriber.nlp_h, transcriber.nlp_g)
         self.casadi_nlp = {'x': transcriber.nlp_x,
-                           'p': casadi.vertcat(transcriber.nlp_p, init_penalty_weight_sym, x_init_sym),
+                           'p': casadi.vertcat(transcriber.nlp_p, init_penalty_weight_sym, y_init_sym),
                            'f': transcriber.nlp_f + init_penalty,
                            'g': self.casadi_g,
         }
@@ -563,7 +569,7 @@ class HomotopyNlpSolver:
     def solver_step(self, x_value, p_value, init_penalty_weight, previous_result=None):
         lbxubx = self.transcriber.nlp_fn_lb_ub.call({'p': p_value})
         call_args = dict(x0=x_value, lbx=lbxubx['lb'], ubx=lbxubx['ub'], lbg=self.casadi_lbg, ubg=self.casadi_ubg,
-                         p=casadi.vertcat(p_value, casadi.DM(init_penalty_weight), x_value))
+                         p=casadi.vertcat(p_value, casadi.DM(init_penalty_weight), x_value[self.y_indices]))
         if previous_result is not None:
             call_args['lam_x0'] = previous_result['lam_x']
             call_args['lam_g0'] = previous_result['lam_g']
