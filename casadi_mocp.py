@@ -31,6 +31,43 @@ INTEGRATION_MATRIX = [
     [               0.05,  0.272222222222222,    0.355555555555556,    0.272222222222222,                 0.05],
 ]
 INTEGRATION_WEIGHTS = [0.05, 0.272222222222222, 0.355555555555556, 0.272222222222222, 0.05]
+INTERPOLATION_WEIGHTS = [14.0, -32.6666666666667, 37.3333333333333, -32.6666666666667, 14.0]
+INTERPOLATION_NODES = [i / 200.0 for i in range(201)]
+
+def _lagrange_rows(local_taus):
+    rows = []
+    for t in local_taus:
+        row = []
+        for j in range(N_NODES):
+            prod = 1.0
+            for m in range(N_NODES):
+                if m != j:
+                    prod *= (t - NODES[m])
+            row.append(prod * INTERPOLATION_WEIGHTS[j])
+        rows.append(row)
+    return rows
+
+def make_phase_interpolation_matrix(n_intervals, tau_evaluation_points):
+    if isinstance(tau_evaluation_points, list):
+        tau_evaluation_points = casadi.DM(tau_evaluation_points)
+    assert tau_evaluation_points.numel() == tau_evaluation_points.size1()
+    assert float(casadi.mmin(casadi.diff(tau_evaluation_points) > 0)) == 1.0, 'Must be ascending'
+    assert float(casadi.mmin(tau_evaluation_points)) >= 0.0
+    assert float(casadi.mmax(tau_evaluation_points)) <= 1.0
+
+    taus_scaled = [float(f) * n_intervals for f in casadi.vertsplit(tau_evaluation_points)]
+    interval_indices = [int(f) for f in taus_scaled]
+    local_taus = [f - int(f) for f in taus_scaled]
+
+    rows = _lagrange_rows(local_taus)
+    n_phase_nodes = n_intervals * (N_NODES - 1) + 1
+    M = casadi.DM(len(local_taus), n_phase_nodes)
+
+    for i, row in enumerate(rows):
+        c = interval_indices[i] * (N_NODES - 1)
+        M[i, c:(c + N_NODES)] = casadi.DM(row).T
+
+    return M
 
 VariableInfo = collections.namedtuple('VariableInfo', ['flag', 'phase', 'name', 'index'])
 
@@ -142,6 +179,7 @@ class Phase:
         self.duration_value = duration_value
         self.constraints = dict()
         self.mean_objectives = dict()
+        self.outputs = dict()
 
     def add_trajectory(self, trajectory_name, init_value):
         assert is_valid_name(trajectory_name)
@@ -149,6 +187,53 @@ class Phase:
         self.trajectories[trajectory_name] = Trajectory(
             self.phase_name, trajectory_name, self.n_intervals, init_value, self)
         return self.trajectories[trajectory_name]
+
+    def add_output(self, name, fn):
+        self.outputs[name] = fn
+
+    def interpolate(self, *args):
+        do_fast = (len(args) == 0)
+        result = {'duration': self.duration_value, 'trajectories': dict(), 'outputs': dict()}
+
+        if do_fast:
+            result['tau_grid'] = [0.0] + [(i + e) / self.n_intervals
+                                          for i in range(self.n_intervals)
+                                          for e in INTERPOLATION_NODES[1:]]
+            for name, t in self.trajectories.items():
+                pieces = []
+                for i in range(self.n_intervals):
+                    idx = [i * (N_NODES - 1) + k for k in range(N_NODES)]
+                    node_vals = casadi.DM([t.values[j] for j in idx])
+                    M = casadi.DM(_lagrange_rows(INTERPOLATION_NODES if i == 0 else INTERPOLATION_NODES[1:]))
+                    pieces.append(M @ node_vals)
+                result['trajectories'][name] = [float(e) for e in casadi.vertsplit(casadi.vertcat(*pieces))]
+            else:
+                tau_grid = args[0]
+                result['tau_grid'] = [float(e) for e in casadi.vertsplit(tau_grid)]
+                M = make_phase_interpolation_matrix(self.n_intervals, tau_grid)
+                for name, t in self.trajectories.items():
+                    result['trajectories'][name] = [float(f) for f in casadi.vertsplit(M @ casadi.DM(t.values))]
+
+            pairs = self.parent_mocp.get_symbol_value_pairs()
+            pairs = list(zip(*pairs))
+            non_path_symbols = casadi.vertcat(*pairs[0])
+            non_path_values = casadi.DM(pairs[1])
+            interiors = casadi.vertcat(*[t.trajectory_interior for t in self.trajectories.values()])
+
+            outputs_fn = casadi.Function('outputs_fn',[non_path_symbols, interiors],list(self.outputs.values()),
+                                         ['non_path_symbols', 'trajectory_interiors'],
+                                         list(self.outputs.keys())).map(len(result['tau_grid']))
+
+            output_values = outputs_fn.call({
+                'non_path_symbols': non_path_values,
+                'trajectory_interiors': casadi.DM([v for v in result['trajectories'].values()])})
+
+            for name in output_values:
+                result['outputs'][name] = [float(f) for f in casadi.vertsplit(output_values[name].T)]
+
+            return result
+
+        return None
 
 
 class MultiPhaseOptimalControlProblem:
@@ -190,6 +275,12 @@ class MultiPhaseOptimalControlProblem:
 
     def get_parameter(self, name):
         return self.parameters[name].symbol
+
+    def add_path_output(self, name, fn):
+        assert isinstance(fn, casadi.SX) and fn.numel() == 1
+        phase_names = get_unique_phase_names(get_all_SX_leaves(fn))
+        assert len(phase_names) == 1, 'Mixed phases!'
+        self.phases[phase_names[0]].add_output(name, fn)
 
     def set_derivative(self, x, dxdt_fn):
         if isinstance(dxdt_fn, float):
