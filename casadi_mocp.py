@@ -58,6 +58,9 @@ def make_phase_interpolation_matrix(n_intervals, tau_evaluation_points):
     taus_scaled = [float(f) * n_intervals for f in casadi.vertsplit(tau_evaluation_points)]
     interval_indices = [int(f) for f in taus_scaled]
     local_taus = [f - int(f) for f in taus_scaled]
+    if interval_indices[-1] == n_intervals:
+        interval_indices[-1] = n_intervals - 1
+        local_taus[-1] = 1.0
 
     rows = _lagrange_rows(local_taus)
     n_phase_nodes = n_intervals * (N_NODES - 1) + 1
