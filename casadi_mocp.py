@@ -210,12 +210,12 @@ class Phase:
                     M = casadi.DM(_lagrange_rows(INTERPOLATION_NODES if i == 0 else INTERPOLATION_NODES[1:]))
                     pieces.append(M @ node_vals)
                 result['trajectories'][name] = [float(e) for e in casadi.vertsplit(casadi.vertcat(*pieces))]
-            else:
-                tau_grid = args[0]
-                result['tau_grid'] = [float(e) for e in casadi.vertsplit(tau_grid)]
-                M = make_phase_interpolation_matrix(self.n_intervals, tau_grid)
-                for name, t in self.trajectories.items():
-                    result['trajectories'][name] = [float(f) for f in casadi.vertsplit(M @ casadi.DM(t.values))]
+        else:
+            tau_grid = args[0]
+            result['tau_grid'] = [float(e) for e in casadi.vertsplit(tau_grid)]
+            M = make_phase_interpolation_matrix(self.n_intervals, tau_grid)
+            for name, t in self.trajectories.items():
+                result['trajectories'][name] = [float(f) for f in casadi.vertsplit(M @ casadi.DM(t.values))]
 
             pairs = self.parent_mocp.get_symbol_value_pairs()
             pairs = list(zip(*pairs))

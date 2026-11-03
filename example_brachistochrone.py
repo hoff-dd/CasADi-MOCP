@@ -35,6 +35,9 @@ def solve_brachistochrone(n_intervals=24):
 
     mocp.add_objective(duration)
 
+    mocp.add_path_output('speed', v)
+    mocp.add_path_output('depth', y)
+
     mocp.solve()
 
     return mocp, duration
@@ -62,6 +65,17 @@ def main():
     print('descent time:             {:.6f} s'.format(optimal_duration))
     print('analytic cycloid optimum: {:.6f} s'.format(reference))
     print('relative error:           {:.2e}'.format(abs(optimal_duration - reference) / reference))
+
+    solution = mocp.phases['descent'].interpolate(casadi.DM([i / 10.0 for i in range(11)]))
+    print()
+    print('   t [s]      x [m]      y [m]    v [m/s]  theta [deg]')
+    for i, tau in enumerate(solution['tau_grid']):
+        print('{:8.4f}  {:9.4f}  {:9.4f}  {:9.4f}  {:11.3f}'.format(
+            tau * optimal_duration,
+            solution['trajectories']['x'][i],
+            solution['trajectories']['y'][i],
+            solution['outputs']['speed'][i],
+            math.degrees(solution['trajectories']['theta'][i])))
 
 if __name__ == '__main__':
     main()
