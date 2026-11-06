@@ -65,6 +65,7 @@ def add_vehicle_phase(mocp, phase_name, n_intervals, thrust, exhaust_speed,durat
     v = casadi.vertcat(vx, vy)
     radius = casadi.sqrt(rx ** 2 + ry ** 2)
     altitude = radius - 1.0
+    speed = casadi.sqrt(vx ** 2 + vy ** 2 + 1e-8)
 
     air_density = mocp.get_parameter('atmosphere_scale') * (AIR_DENSITY_SEA_LEVEL / DENSITY_SCALE) * casadi.exp(-altitude * LENGTH_SCALE / SCALE_HEIGHT)
     air_relative_velocity = v - ROTATION_RATE * casadi.vertcat(ry, -rx)
@@ -90,6 +91,11 @@ def add_vehicle_phase(mocp, phase_name, n_intervals, thrust, exhaust_speed,durat
     mocp.set_derivative(ry, vy)
     mocp.set_derivative(vx, acceleration[0])
     mocp.set_derivative(vy, acceleration[1])
+
+    mocp.add_path_output('altitude_km', altitude * LENGTH_SCALE / 1e3)
+    mocp.add_path_output('speed_km_s', speed * SPEED_SCALE / 1e3)
+    mocp.add_path_output('dynamic_pressure_kPa', dynamic_pressure * PRESSURE_SCALE / 1e3)
+    mocp.add_path_output('mass_t', mass * MASS_SCALE / 1e3)
 
     return types.SimpleNamespace(name=phase_name, duration=duration, r=r, v=v, rx=rx, ry=ry, vx=vx, vy=vy, mass=mass,
                                  pitch=pitch, altitude=altitude, dynamic_pressure=dynamic_pressure)
@@ -168,19 +174,42 @@ def solve_ascent():
 
     return mocp, phases, slack_values
 
+def print_trajectory(mocp, phases):
+    print()
+    print('   phase       t [s]   alt [km]   v [km/s]    q [kPa]  mass [t]  pitch [deg]')
+    time_offset = 0.0
+    for phase in phases:
+        duration = mocp.get_value(phase.duration) * TIME_SCALE
+        samples = mocp.phases[phase.name].interpolate(
+            casadi.DM([0.0, 0.25, 0.5, 0.75, 1.0]))
+        for i, tau in enumerate(samples['tau_grid']):
+            pitch = samples['trajectories']['pitch'][i] if phase.pitch is not None else float('nan')
+            print('{:>9s}  {:10.1f} {:10.1f} {:10.3f} {:10.2f} {:9.1f} {:12.1f}'.format(
+                phase.name, time_offset + tau * duration,
+                samples['outputs']['altitude_km'][i],
+                samples['outputs']['speed_km_s'][i],
+                samples['outputs']['dynamic_pressure_kPa'][i],
+                samples['outputs']['mass_t'][i],
+                math.degrees(pitch)))
+        time_offset += duration
+
 def main():
     mocp, phases, slack_values = solve_ascent()
     boost, coast, insertion = phases
 
+    max_q = max(mocp.phases['boost'].interpolate()['outputs']['dynamic_pressure_kPa'])
     print()
     print('S-IB burn time     {:9.1f} s'.format(mocp.get_value(boost.duration) * TIME_SCALE))
     print('S-IVB burn time    {:9.1f} s'.format(mocp.get_value(insertion.duration) * TIME_SCALE))
     print('propellant left    {:9.0f} kg'.format(S_IVB_PROPELLANT - mocp.get_value(insertion.duration) * TIME_SCALE
                                                  * S_IVB_THRUST / (S_IVB_ISP * G0)))
     print('mass into orbit    {:9.0f} kg'.format(mocp.get_value(mocp.end(insertion.mass)) * MASS_SCALE))
+    print('max dynamic press. {:9.1f} kPa'.format(max_q))
 
     for name, value in slack_values:
         print('slack {:24s} {:.3e}'.format(name, value))
+
+    print_trajectory(mocp, phases)
 
 
 if __name__ == '__main__':

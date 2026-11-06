@@ -217,26 +217,24 @@ class Phase:
             for name, t in self.trajectories.items():
                 result['trajectories'][name] = [float(f) for f in casadi.vertsplit(M @ casadi.DM(t.values))]
 
-            pairs = self.parent_mocp.get_symbol_value_pairs()
-            pairs = list(zip(*pairs))
-            non_path_symbols = casadi.vertcat(*pairs[0])
-            non_path_values = casadi.DM(pairs[1])
-            interiors = casadi.vertcat(*[t.trajectory_interior for t in self.trajectories.values()])
+        pairs = self.parent_mocp.get_symbol_value_pairs()
+        pairs = list(zip(*pairs))
+        non_path_symbols = casadi.vertcat(*pairs[0])
+        non_path_values = casadi.DM(pairs[1])
+        interiors = casadi.vertcat(*[t.trajectory_interior for t in self.trajectories.values()])
 
-            outputs_fn = casadi.Function('outputs_fn',[non_path_symbols, interiors],list(self.outputs.values()),
-                                         ['non_path_symbols', 'trajectory_interiors'],
-                                         list(self.outputs.keys())).map(len(result['tau_grid']))
+        outputs_fn = casadi.Function('outputs_fn',[non_path_symbols, interiors],list(self.outputs.values()),
+                                     ['non_path_symbols', 'trajectory_interiors'],
+                                     list(self.outputs.keys())).map(len(result['tau_grid']))
 
-            output_values = outputs_fn.call({
-                'non_path_symbols': non_path_values,
-                'trajectory_interiors': casadi.DM([v for v in result['trajectories'].values()])})
+        output_values = outputs_fn.call({
+            'non_path_symbols': non_path_values,
+            'trajectory_interiors': casadi.DM([v for v in result['trajectories'].values()])})
 
-            for name in output_values:
-                result['outputs'][name] = [float(f) for f in casadi.vertsplit(output_values[name].T)]
+        for name in output_values:
+            result['outputs'][name] = [float(f) for f in casadi.vertsplit(output_values[name].T)]
 
-            return result
-
-        return None
+        return result
 
 
 class MultiPhaseOptimalControlProblem:
