@@ -47,6 +47,11 @@ def _lagrange_rows(local_taus):
         rows.append(row)
     return rows
 
+def make_phase_nodes(n_intervals):
+    nodes = [(n + i) / n_intervals for i in range(n_intervals) for n in NODES[:-1]]
+    nodes.append(1.0)
+    return nodes
+
 def make_phase_interpolation_matrix(n_intervals, tau_evaluation_points):
     if isinstance(tau_evaluation_points, list):
         tau_evaluation_points = casadi.DM(tau_evaluation_points)
@@ -193,6 +198,12 @@ class Phase:
 
     def add_output(self, name, fn):
         self.outputs[name] = fn
+
+    def change_time_resolution(self, n_intervals_new):
+        M = make_phase_interpolation_matrix(self.n_intervals, make_phase_nodes(n_intervals_new))
+        for t in self.trajectories.values():
+            t.values = [float(f) for f in casadi.vertsplit(M @ casadi.DM(t.values))]
+        self.n_intervals = n_intervals_new
 
     def interpolate(self, *args):
         do_fast = (len(args) == 0)
