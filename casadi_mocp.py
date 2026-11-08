@@ -47,6 +47,8 @@ def _lagrange_rows(local_taus):
         rows.append(row)
     return rows
 
+_DENSE_INTERPOLATION_MATRIX = _lagrange_rows(INTERPOLATION_NODES)
+
 def make_phase_nodes(n_intervals):
     nodes = [(n + i) / n_intervals for i in range(n_intervals) for n in NODES[:-1]]
     nodes.append(1.0)
@@ -93,17 +95,7 @@ def is_valid_name(s):
     return re.fullmatch(r'\w+', s) is not None
 
 def get_all_SX_leaves(e):
-    result = []
-    stack = [e]
-    while stack:
-        x = stack.pop()
-        if x.is_leaf():
-            if x.is_symbolic() and not any(casadi.is_equal(x, r) for r in result):
-                result.append(x)
-        else:
-            for i in range(x.n_dep()):
-                stack.append(x.dep(i))
-    return result
+    return list(casadi.symvar(e))
 
 def has_trajectory_variable(sx_list):
     return any(parse_variable_name(v.name()).flag == 'T' for v in sx_list)
@@ -213,13 +205,14 @@ class Phase:
             result['tau_grid'] = [0.0] + [(i + e) / self.n_intervals
                                           for i in range(self.n_intervals)
                                           for e in INTERPOLATION_NODES[1:]]
+            M_closed = casadi.DM(_DENSE_INTERPOLATION_MATRIX)
+            M_open = casadi.DM(_DENSE_INTERPOLATION_MATRIX[1:])
             for name, t in self.trajectories.items():
                 pieces = []
                 for i in range(self.n_intervals):
                     idx = [i * (N_NODES - 1) + k for k in range(N_NODES)]
                     node_vals = casadi.DM([t.values[j] for j in idx])
-                    M = casadi.DM(_lagrange_rows(INTERPOLATION_NODES if i == 0 else INTERPOLATION_NODES[1:]))
-                    pieces.append(M @ node_vals)
+                    pieces.append((M_closed if i == 0 else M_open) @ node_vals)
                 result['trajectories'][name] = [float(e) for e in casadi.vertsplit(casadi.vertcat(*pieces))]
         else:
             tau_grid = args[0]
