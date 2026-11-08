@@ -163,13 +163,18 @@ def build_problem(n_intervals=8):
     return mocp, (boost, coast, insertion)
 
 
-def solve_ascent():
+def solve_ascent(refined_intervals=16):
     mocp, phases = build_problem()
     atmosphere_scale = mocp.get_parameter('atmosphere_scale')
 
     mocp.set_value(atmosphere_scale, 0.0)
     mocp.solve()
     mocp.set_value(atmosphere_scale, 1.0)
+    mocp.solve()
+    for phase in phases:
+        if phase.pitch is not None:
+            mocp.phases[phase.name].change_time_resolution(refined_intervals)
+
     _, slack_values = mocp.solve()
 
     return mocp, phases, slack_values

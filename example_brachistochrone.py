@@ -10,7 +10,7 @@ GRAVITY = 9.80665
 X_END = 2.0
 Y_END = 2.0
 
-def solve_brachistochrone(n_intervals=24):
+def solve_brachistochrone(n_intervals=6, refined_intervals=24):
     mocp = MultiPhaseOptimalControlProblem()
 
     duration = mocp.create_phase('descent', init=1.0, n_intervals=n_intervals)
@@ -39,8 +39,12 @@ def solve_brachistochrone(n_intervals=24):
     mocp.add_path_output('depth', y)
 
     mocp.solve()
+    coarse_duration = mocp.get_value(duration)
 
-    return mocp, duration
+    mocp.phases['descent'].change_time_resolution(refined_intervals)
+    mocp.solve()
+
+    return mocp, duration, coarse_duration
 
 def analytic_optimum():
     def residual(u):
@@ -57,14 +61,15 @@ def analytic_optimum():
     return math.sqrt(a / GRAVITY) * u_end
 
 def main():
-    mocp, duration = solve_brachistochrone()
+    mocp, duration, coarse_duration = solve_brachistochrone()
     optimal_duration = mocp.get_value(duration)
     reference = analytic_optimum()
 
     print()
-    print('descent time:             {:.6f} s'.format(optimal_duration))
-    print('analytic cycloid optimum: {:.6f} s'.format(reference))
-    print('relative error:           {:.2e}'.format(abs(optimal_duration - reference) / reference))
+    print('descent time,  6 intervals: {:.6f} s'.format(coarse_duration))
+    print('descent time, 24 intervals: {:.6f} s'.format(optimal_duration))
+    print('analytic cycloid optimum:   {:.6f} s'.format(reference))
+    print('relative error:             {:.2e}'.format(abs(optimal_duration - reference) / reference))
 
     solution = mocp.phases['descent'].interpolate(casadi.DM([i / 10.0 for i in range(11)]))
     print()
