@@ -447,6 +447,7 @@ class Transcriber:
             for tt in tp.trajectories.values():
                 if tt.ode_node_defects is not None:
                     equality_constraints.append(tt.ode_node_defects)
+        for tp in self.phases.values():
             equality_constraints.extend(c.g_nodes for c in tp.constraints.values() if c.ocp_constraint.is_equation)
             inequality_constraints.extend(c.g_nodes for c in tp.constraints.values() if not c.ocp_constraint.is_equation)
         equality_constraints.extend(c.g for c in mocp.constraints.values() if c.is_equation)
