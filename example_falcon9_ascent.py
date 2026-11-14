@@ -31,8 +31,10 @@ MERLIN_EXHAUST_SPEED = 3076.0    # m/s
 MERLIN_EXIT_AREA = 0.7           # m^2
 MERLIN_EXIT_PRESSURE = 60000.0   # Pa
 MERLIN_MAX_MASS_FLOW = 287.0     # kg/s per engine
+MERLIN_MIN_MASS_FLOW = 162.0     # kg/s per engine
 MVAC_EXHAUST_SPEED = 3413.0      # m/s (effective, vacuum)
 MVAC_MAX_MASS_FLOW = 287.0       # kg/s
+MVAC_MIN_MASS_FLOW = 183.0       # kg/s
 DRAG_AREA = 5.3                  # m^2  (Cd * A)
 STAGING_COAST_TIME = 11.0        # s
 PAYLOAD_GUESS = 15000.0          # kg
@@ -105,6 +107,7 @@ def add_vehicle_phase(mocp, phase_name, n_intervals, frame, engine, duration_gue
     v = casadi.vertcat(vx, vy, vz)
     radius = casadi.sqrt(casadi.sumsqr(r))
     altitude = radius - 1.0
+    speed = casadi.sqrt(casadi.sumsqr(v) + 1e-8)
 
     atmosphere_scale = mocp.get_parameter('atmosphere_scale')
     atmosphere_fraction = atmosphere_scale * casadi.exp(-altitude * LENGTH_SCALE / SCALE_HEIGHT)
@@ -120,16 +123,19 @@ def add_vehicle_phase(mocp, phase_name, n_intervals, frame, engine, duration_gue
     # Stay above the ground
     mocp.add_path_constraint(rx ** 2 + ry ** 2 + rz ** 2 > 1.0)
 
-    pitch = yaw = None
+    pitch = yaw = throttle = None
     if engine is not None:
         pitch = mocp.add_trajectory(phase_name, 'pitch', init=pitch_guess)
         yaw = mocp.add_trajectory(phase_name, 'yaw', init=0.0)
+        throttle = mocp.add_trajectory(phase_name, 'throttle', init=1.0)
         mocp.add_path_constraint(pitch > -0.2)
         mocp.add_path_constraint(pitch < 0.5 * math.pi + 1.0)
         mocp.add_path_constraint(yaw > -0.5)
         mocp.add_path_constraint(yaw < 0.5)
+        mocp.add_path_constraint(throttle > engine.min_mass_flow / engine.max_mass_flow)
+        mocp.add_path_constraint(throttle < 1.0)
 
-        mass_flow = engine.count * (engine.max_mass_flow / MASS_FLOW_SCALE)
+        mass_flow = engine.count * throttle * (engine.max_mass_flow / MASS_FLOW_SCALE)
         thrust = mass_flow * (engine.exhaust_speed / SPEED_SCALE) \
                  + engine.count * (engine.exit_area / LENGTH_SCALE ** 2) \
                  * (engine.exit_pressure / PRESSURE_SCALE - air_pressure)
@@ -146,8 +152,13 @@ def add_vehicle_phase(mocp, phase_name, n_intervals, frame, engine, duration_gue
     mocp.set_derivative(vy, acceleration[1])
     mocp.set_derivative(vz, acceleration[2])
 
+    mocp.add_path_output('altitude_km', altitude * LENGTH_SCALE / 1e3)
+    mocp.add_path_output('speed_km_s', speed * SPEED_SCALE / 1e3)
+    mocp.add_path_output('dynamic_pressure_kPa', dynamic_pressure * PRESSURE_SCALE / 1e3)
+    mocp.add_path_output('mass_t', mass * MASS_SCALE / 1e3)
+
     return types.SimpleNamespace(name=phase_name, duration=duration, r=r, v=v, rx=rx, ry=ry, rz=rz,
-                                 vx=vx, vy=vy, vz=vz, mass=mass, pitch=pitch, yaw=yaw,
+                                 vx=vx, vy=vy, vz=vz, mass=mass, pitch=pitch, yaw=yaw, throttle=throttle,
                                  altitude=altitude, dynamic_pressure=dynamic_pressure)
 
 def build_problem(frame, n_intervals=8):
@@ -156,9 +167,10 @@ def build_problem(frame, n_intervals=8):
     mocp.add_parameter('atmosphere_scale', init=1.0)
 
     merlin = types.SimpleNamespace(count=S1_ENGINE_COUNT, exhaust_speed=MERLIN_EXHAUST_SPEED,
-                                   max_mass_flow=MERLIN_MAX_MASS_FLOW, exit_area=MERLIN_EXIT_AREA,
-                                   exit_pressure=MERLIN_EXIT_PRESSURE)
-    merlin_vacuum = types.SimpleNamespace(count=1, exhaust_speed=MVAC_EXHAUST_SPEED, max_mass_flow=MVAC_MAX_MASS_FLOW,
+                                   max_mass_flow=MERLIN_MAX_MASS_FLOW, min_mass_flow=MERLIN_MIN_MASS_FLOW,
+                                   exit_area=MERLIN_EXIT_AREA, exit_pressure=MERLIN_EXIT_PRESSURE)
+    merlin_vacuum = types.SimpleNamespace(count=1, exhaust_speed=MVAC_EXHAUST_SPEED,
+                                          max_mass_flow=MVAC_MAX_MASS_FLOW, min_mass_flow=MVAC_MIN_MASS_FLOW,
                                           exit_area=0.0, exit_pressure=0.0)
 
     burn_time_1 = S1_PROPELLANT / (S1_ENGINE_COUNT * MERLIN_MAX_MASS_FLOW) / TIME_SCALE
@@ -221,7 +233,6 @@ def build_problem(frame, n_intervals=8):
     slack_dynamic_pressure = mocp.add_variable('slack_dynamic_pressure', init=0.1)
     mocp.add_constraint(slack_dynamic_pressure > 0.0)
     mocp.add_objective(1.0 * slack_dynamic_pressure)
-    mocp.add_path_constraint(boost.dynamic_pressure * (PRESSURE_SCALE / MAX_DYNAMIC_PRESSURE) < 1.0 + slack_dynamic_pressure)
     for phase in (boost, coast):
         mocp.add_path_constraint(phase.dynamic_pressure * (PRESSURE_SCALE / MAX_DYNAMIC_PRESSURE) < 1.0 + slack_dynamic_pressure)
 
@@ -243,6 +254,29 @@ def solve_ascent():
 
     return mocp, phases, payload, slack_values
 
+def print_trajectory(mocp, phases):
+    print()
+    print('    phase      t [s]   alt [km]   v [km/s]    q [kPa]  mass [t]  pitch [deg]  yaw [deg]  throttle')
+    time_offset = 0.0
+    for phase in phases:
+        duration = mocp.get_value(phase.duration) * TIME_SCALE
+        samples = mocp.phases[phase.name].interpolate(casadi.DM([0.0, 0.25, 0.5, 0.75, 1.0]))
+        for i, tau in enumerate(samples['tau_grid']):
+            if phase.pitch is not None:
+                pitch = samples['trajectories']['pitch'][i]
+                yaw = samples['trajectories']['yaw'][i]
+                throttle = samples['trajectories']['throttle'][i]
+            else:
+                pitch = yaw = throttle = float('nan')
+            print('{:>9s}  {:9.1f} {:10.1f} {:10.3f} {:10.2f} {:9.1f} {:12.1f} {:10.2f} {:9.2f}'
+                  .format(phase.name, time_offset + tau * duration,
+                          samples['outputs']['altitude_km'][i],
+                          samples['outputs']['speed_km_s'][i],
+                          samples['outputs']['dynamic_pressure_kPa'][i],
+                          samples['outputs']['mass_t'][i],
+                          math.degrees(pitch), math.degrees(yaw), throttle))
+        time_offset += duration
+
 def main():
     mocp, phases, payload, slack_values = solve_ascent()
     boost, coast, insertion = phases
@@ -250,6 +284,7 @@ def main():
     payload_mass = mocp.get_value(payload) * MASS_SCALE
     s1_propellant_used = (mocp.get_value(mocp.start(boost.mass))- mocp.get_value(mocp.end(boost.mass))) * MASS_SCALE
     s2_propellant_used = (mocp.get_value(mocp.start(insertion.mass)) - mocp.get_value(mocp.end(insertion.mass))) * MASS_SCALE
+    max_q = max(max(mocp.phases[name].interpolate()['outputs']['dynamic_pressure_kPa']) for name in ('boost', 'coast'))
 
     print()
     print('first stage burn   {:9.1f} s'.format(mocp.get_value(boost.duration) * TIME_SCALE))
@@ -258,8 +293,11 @@ def main():
     print('S2 propellant left {:9.0f} kg'.format(S2_PROPELLANT - s2_propellant_used))
     print('lift-off mass      {:9.0f} kg'.format(STACK_MASS + payload_mass))
     print('payload into orbit {:9.0f} kg'.format(payload_mass))
+    print('max dynamic press. {:9.1f} kPa'.format(max_q))
     for name, value in slack_values:
         print('slack {:24s} {:.3e}'.format(name, value))
+
+    print_trajectory(mocp, phases)
 
 if __name__ == '__main__':
     main()
